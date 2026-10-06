@@ -1,0 +1,16 @@
+{
+  "name": "sdcc-webassembly",
+  "version": "1.0.0",
+  "description": "SDCC and GBDK-2020 compiled to WebAssembly: build Game Boy ROMs from C in the browser. The compiler engine of CAPSIMO.",
+  "private": true,
+  "license": "GPL-3.0-or-later",
+  "author": "Nolann Morencé (exagyde)",
+  "scripts": {
+    "build": "bash build.sh",
+    "test": "node test/hello.mjs",
+    "release": "bash scripts/release.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

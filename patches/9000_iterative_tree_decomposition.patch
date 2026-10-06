@@ -1,0 +1,1071 @@
+Make SDCC's recursive tree decomposition walks iterative.
+
+In a browser, every WebAssembly call runs on the worker's native stack,
+which is limited to a few hundred KB (Safari reported "Maximum call stack
+size exceeded"). This patch turns the recursive walks of the register
+allocator and of the lospre and naddr optimizations into loops with an
+explicit stack. The generated code is unchanged; compiling GB Studio's
+engine then fits in 100 KB of stack (measured with node --stack-size).
+
+Applies with `patch -p0` on top of SDCC r15267 and the GBDK-2020 patches.
+
+SPDX-License-Identifier: GPL-2.0-or-later
+Copyright (C) 2026 Nolann Morencé (exagyde)
+Part of sdcc-webassembly, the in-browser compiler engine of CAPSIMO.
+
+--- sdcc/src/SDCCralloc.hpp
++++ sdcc/src/SDCCralloc.hpp
+@@ -48,6 +48,7 @@
+ #include <iostream>
+ #include <limits>
+ #include <utility>
++#include <vector>
+ #include <sstream>
+ #include <fstream>
+ 
+@@ -1127,46 +1128,92 @@
+   a = *ai_best;
+ }
+ 
+-// Handle nodes in the tree decomposition, by detecting their type and calling the appropriate function. Recurses.
++// Handle nodes in the tree decomposition, by detecting their type and calling the appropriate function.
+ template <class T_t, class G_t, class I_t>
+-static void tree_dec_ralloc_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t, const G_t &G, const I_t &I, const assignment& ac, bool *const assignment_optimal)
++static void tree_dec_ralloc_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root, const G_t &G, const I_t &I, const assignment& root_ac, bool *const assignment_optimal)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
+-
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  boost::tie(c, c_end) = adjacent_vertices(t, T);
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    vertex_t c1;
++    const assignment *ac;
++    assignment *ac2;
++    int stage;
++  };
+ 
+-  switch (out_degree(t, T))
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, root, &root_ac, 0, 0});
++
++  while (!stack.empty())
+     {
+-    case 0:
+-      tree_dec_ralloc_leaf(T, t, G, I);
+-      break;
+-    case 1:
+-      c0 = *c;
+-      tree_dec_ralloc_nodes(T, c0, G, I, ac, assignment_optimal);
+-      T[c0].bag.size() < T[t].bag.size() ? tree_dec_ralloc_introduce(T, t, G, I, ac, assignment_optimal) : tree_dec_ralloc_forget(T, t, G, I);
+-      break;
+-    case 2:
+-      c0 = *c++;
+-      c1 = *c;
++      frame &f = stack.back();
++      const vertex_t t = f.t;
+ 
+-      if (T[c0].weight < T[c1].weight) // Minimize memory consumption needed for keeping intermediate results. As a side effect, this also helps the ac mechanism in the heuristic.
+-        std::swap (c0, c1);
+-
+-      tree_dec_ralloc_nodes(T, c0, G, I, ac, assignment_optimal);
++      switch (out_degree(t, T))
+         {
+-          assignment *ac2 = new assignment;
+-          get_best_local_assignment_biased(*ac2, c0, T);
+-          tree_dec_ralloc_nodes(T, c1, G, I, *ac2, assignment_optimal);
+-          delete ac2;
++        case 0:
++          tree_dec_ralloc_leaf(T, t, G, I);
++          stack.pop_back();
++          break;
++        case 1:
++          if (f.stage == 0)
++            {
++              adjacency_iter_t c, c_end;
++              boost::tie(c, c_end) = adjacent_vertices(t, T);
++              const vertex_t c0 = *c;
++              const assignment *ac = f.ac;
++              f.c0 = c0;
++              f.stage = 1;
++              stack.push_back(frame{c0, c0, c0, ac, 0, 0});
++            }
++          else
++            {
++              T[f.c0].bag.size() < T[t].bag.size() ? tree_dec_ralloc_introduce(T, t, G, I, *f.ac, assignment_optimal) : tree_dec_ralloc_forget(T, t, G, I);
++              stack.pop_back();
++            }
++          break;
++        case 2:
++          if (f.stage == 0)
++            {
++              adjacency_iter_t c, c_end;
++              boost::tie(c, c_end) = adjacent_vertices(t, T);
++              vertex_t c0 = *c++;
++              vertex_t c1 = *c;
++
++              if (T[c0].weight < T[c1].weight) // Minimize memory consumption needed for keeping intermediate results. As a side effect, this also helps the ac mechanism in the heuristic.
++                std::swap (c0, c1);
++
++              const assignment *ac = f.ac;
++              f.c0 = c0;
++              f.c1 = c1;
++              f.stage = 1;
++              stack.push_back(frame{c0, c0, c0, ac, 0, 0});
++            }
++          else if (f.stage == 1)
++            {
++              assignment *ac2 = new assignment;
++              get_best_local_assignment_biased(*ac2, f.c0, T);
++              const vertex_t c1 = f.c1;
++              f.ac2 = ac2;
++              f.stage = 2;
++              stack.push_back(frame{c1, c1, c1, ac2, 0, 0});
++            }
++          else
++            {
++              delete f.ac2;
++              tree_dec_ralloc_join(T, t, G, I);
++              stack.pop_back();
++            }
++          break;
++        default:
++          std::cerr << "Not nice.\n";
++          stack.pop_back();
++          break;
+         }
+-      tree_dec_ralloc_join(T, t, G, I);
+-      break;
+-    default:
+-      std::cerr << "Not nice.\n";
+-      break;
+     }
+ }
+ 
+--- sdcc/src/SDCCtree_dec.hpp
++++ sdcc/src/SDCCtree_dec.hpp
+@@ -221,42 +221,40 @@
+ }
+ 
+ template <class T_t, class v_t, class G_t>
+-void add_vertices_to_tree_decomposition(T_t &T, const v_t v, const v_t v_end, G_t &G, std::vector<bool> &active)
++void add_vertices_to_tree_decomposition(T_t &T, const v_t v_begin, const v_t v_end, G_t &G, std::vector<bool> &active)
+ {
+-  // Base case: Empty graph. Create an empty bag.
+-  if (v == v_end)
+-    {
+-      boost::add_vertex(T);
+-      return;
+-    }
+-
+-  // Todo: A more elegant solution, e.g. using subgraphs or filtered graphs.
+-
+   typedef typename boost::graph_traits<G_t>::adjacency_iterator adjacency_iter_t;
+   typedef typename boost::property_map<G_t, boost::vertex_index_t>::type index_map;
++  typedef decltype(T[0].bag) bag_t;
+   index_map index = boost::get(boost::vertex_index, G);
+ 
+-  // Get the neigbours
+-  adjacency_iter_t n, n_end;
+-  decltype(T[0].bag) neighbours;
+-  for (boost::tie(n, n_end) = boost::adjacent_vertices(*v, G); n != n_end; ++n)
+-    if (active[index[*n]])
+-      neighbours.insert(index[*n]);
++  std::vector<std::pair<unsigned int, bag_t> > steps;
+ 
+-  // Recurse
+-  active[*v] = false;
+-  make_clique(neighbours, G);
+-  v_t v_next = v;
+-  add_vertices_to_tree_decomposition(T, ++v_next, v_end, G, active);
++  for (v_t v = v_begin; v != v_end; ++v)
++    {
++      adjacency_iter_t n, n_end;
++      bag_t neighbours;
++      for (boost::tie(n, n_end) = boost::adjacent_vertices(*v, G); n != n_end; ++n)
++        if (active[index[*n]])
++          neighbours.insert(index[*n]);
+ 
+-  // Add new bag
+-  typename boost::graph_traits<T_t>::vertex_iterator t;
+-  typename boost::graph_traits<T_t>::vertex_descriptor s;
+-  t = find_bag(neighbours, T);
+-  s = boost::add_vertex(T);
+-  boost::add_edge(*t, s, T);
+-  T[s].bag = neighbours;
+-  T[s].bag.insert(*v);
++      active[*v] = false;
++      make_clique(neighbours, G);
++      steps.push_back(std::make_pair(*v, neighbours));
++    }
++
++  boost::add_vertex(T);
++
++  for (typename std::vector<std::pair<unsigned int, bag_t> >::reverse_iterator step = steps.rbegin(); step != steps.rend(); ++step)
++    {
++      typename boost::graph_traits<T_t>::vertex_iterator t;
++      typename boost::graph_traits<T_t>::vertex_descriptor s;
++      t = find_bag(step->second, T);
++      s = boost::add_vertex(T);
++      boost::add_edge(*t, s, T);
++      T[s].bag = step->second;
++      T[s].bag.insert(step->first);
++    }
+ }
+ 
+ // Create a tree decomposition from an elimination ordering.
+@@ -288,185 +286,287 @@
+ // Ensure that all joins are at proper join nodes: Each node that has two children has the same bag as its children.
+ // Complexity: Linear in the number of vertices of T.
+ template <class T_t>
+-void nicify_joins(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t)
++void nicify_joins(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    vertex_t c1;
++    int stage;
++  };
+ 
+-  boost::tie(c, c_end) = boost::adjacent_vertices(t, T);
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, root, 0});
+ 
+-  switch (out_degree(t, T))
++  while (!stack.empty())
+     {
+-    case 0:
+-      return;
+-    case 1:
+-      nicify_joins(T, *c);
+-      return;
+-    case 2:
+-      break;
+-    default:
+-      c0 = *c++;
+-      c1 = *c;
+-      typename boost::graph_traits<T_t>::vertex_descriptor d;
+-      d = boost::add_vertex(T);
+-      add_edge(d, c0, T);
+-      add_edge(d, c1, T);
+-      boost::remove_edge(t, c0, T);
+-      boost::remove_edge(t, c1, T);
+-      T[d].bag = T[t].bag;
+-      boost::add_edge(t, d, T);
+-      nicify_joins(T, t);
+-      return;
+-    }
++      frame &f = stack.back();
++      const vertex_t t = f.t;
+ 
+-  c0 = *c++;
+-  c1 = *c;
+-  nicify_joins(T, c0);
+-  if (T[t].bag != T[c0].bag)
+-    {
+-      typename boost::graph_traits<T_t>::vertex_descriptor d;
+-      d = boost::add_vertex(T);
+-      boost::add_edge(d, c0, T);
+-      boost::remove_edge(t, c0, T);
+-      T[d].bag = T[t].bag;
+-      boost::add_edge(t, d, T);
+-    }
+-  nicify_joins(T, c1);
+-  if (T[t].bag != T[c1].bag)
+-    {
+-      typename boost::graph_traits<T_t>::vertex_descriptor d = boost::add_vertex(T);
+-      boost::add_edge(d, c1, T);
+-      boost::remove_edge(t, c1, T);
+-      T[d].bag = T[t].bag;
+-      boost::add_edge(t, d, T);
++      if (f.stage == 0)
++        {
++          adjacency_iter_t c, c_end;
++          boost::tie(c, c_end) = boost::adjacent_vertices(t, T);
++
++          switch (out_degree(t, T))
++            {
++            case 0:
++              stack.pop_back();
++              continue;
++            case 1:
++              f.t = *c;
++              continue;
++            case 2:
++              break;
++            default:
++              {
++                const vertex_t c0 = *c++;
++                const vertex_t c1 = *c;
++                vertex_t d;
++                d = boost::add_vertex(T);
++                add_edge(d, c0, T);
++                add_edge(d, c1, T);
++                boost::remove_edge(t, c0, T);
++                boost::remove_edge(t, c1, T);
++                T[d].bag = T[t].bag;
++                boost::add_edge(t, d, T);
++              }
++              continue;
++            }
++
++          const vertex_t c0 = *c++;
++          const vertex_t c1 = *c;
++          f.c0 = c0;
++          f.c1 = c1;
++          f.stage = 1;
++          stack.push_back(frame{c0, c0, c0, 0});
++        }
++      else if (f.stage == 1)
++        {
++          const vertex_t c0 = f.c0;
++          const vertex_t c1 = f.c1;
++          if (T[t].bag != T[c0].bag)
++            {
++              vertex_t d;
++              d = boost::add_vertex(T);
++              boost::add_edge(d, c0, T);
++              boost::remove_edge(t, c0, T);
++              T[d].bag = T[t].bag;
++              boost::add_edge(t, d, T);
++            }
++          f.stage = 2;
++          stack.push_back(frame{c1, c1, c1, 0});
++        }
++      else
++        {
++          const vertex_t c1 = f.c1;
++          if (T[t].bag != T[c1].bag)
++            {
++              vertex_t d = boost::add_vertex(T);
++              boost::add_edge(d, c1, T);
++              boost::remove_edge(t, c1, T);
++              T[d].bag = T[t].bag;
++              boost::add_edge(t, d, T);
++            }
++          stack.pop_back();
++        }
+     }
+ }
+ 
+ // Ensure that all nodes' bags are either a subset or a superset of their successors'.
+ // Complexity: Linear in the number of vertices of T.
+ template <class T_t>
+-void nicify_diffs(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t)
++void nicify_diffs(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    int stage;
++  };
+ 
+-  boost::tie(c, c_end) = adjacent_vertices(t, T);
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, 0});
+ 
+-  switch (boost::out_degree(t, T))
++  while (!stack.empty())
+     {
+-    case 0:
+-      if (T[t].bag.size())
+-        boost::add_edge(t, boost::add_vertex(T), T);
+-      return;
+-    case 1:
+-      break;
+-    case 2:
+-      c0 = *c++;
+-      c1 = *c;
+-      nicify_diffs(T, c0);
+-      nicify_diffs(T, c1);
+-      return;
+-    default:
+-      std::cerr << "nicify_diffs error.\n";
+-      return;
+-    }
++      frame &f = stack.back();
++      const vertex_t t = f.t;
+ 
+-  c0 = *c;
+-  nicify_diffs(T, c0);
++      if (f.stage == 0)
++        {
++          adjacency_iter_t c, c_end;
++          boost::tie(c, c_end) = adjacent_vertices(t, T);
+ 
+-  // Redundant bags are isolated, and thus marked for later removal.
+-  if (T[t].bag == T[c0].bag)
+-    {
+-      T[c0].bag.clear();
+-      boost::remove_edge(t, c0, T);
+-      adjacency_iter_t c, c_end;
+-      for(boost::tie(c, c_end) = adjacent_vertices(c0, T); c != c_end; ++c)
+-        boost::add_edge(t, *c, T);
+-      boost::clear_vertex(c0, T);
+-    }
++          switch (boost::out_degree(t, T))
++            {
++            case 0:
++              if (T[t].bag.size())
++                boost::add_edge(t, boost::add_vertex(T), T);
++              stack.pop_back();
++              continue;
++            case 1:
++              break;
++            case 2:
++              {
++                const vertex_t c0 = *c++;
++                const vertex_t c1 = *c;
++                f.t = c1;
++                stack.push_back(frame{c0, c0, 0});
++              }
++              continue;
++            default:
++              std::cerr << "nicify_diffs error.\n";
++              stack.pop_back();
++              continue;
++            }
+ 
+-  if (std::includes(T[t].bag.begin(), T[t].bag.end(), T[c0].bag.begin(), T[c0].bag.end()) || std::includes(T[c0].bag.begin(), T[c0].bag.end(), T[t].bag.begin(), T[t].bag.end()))
+-    return;
++          const vertex_t c0 = *c;
++          f.c0 = c0;
++          f.stage = 1;
++          stack.push_back(frame{c0, c0, 0});
++          continue;
++        }
+ 
+-  typename boost::graph_traits<T_t>::vertex_descriptor d = boost::add_vertex(T);
++      const vertex_t c0 = f.c0;
++      stack.pop_back();
+ 
+-  boost::add_edge(d, c0, T);
+-  boost::remove_edge(t, c0, T);
+-  std::set_intersection(T[t].bag.begin(), T[t].bag.end(), T[c0].bag.begin(), T[c0].bag.end(), std::inserter(T[d].bag, T[d].bag.begin()));
+-  boost::add_edge(t, d, T);
++      // Redundant bags are isolated, and thus marked for later removal.
++      if (T[t].bag == T[c0].bag)
++        {
++          T[c0].bag.clear();
++          boost::remove_edge(t, c0, T);
++          adjacency_iter_t c, c_end;
++          for(boost::tie(c, c_end) = adjacent_vertices(c0, T); c != c_end; ++c)
++            boost::add_edge(t, *c, T);
++          boost::clear_vertex(c0, T);
++        }
++
++      if (std::includes(T[t].bag.begin(), T[t].bag.end(), T[c0].bag.begin(), T[c0].bag.end()) || std::includes(T[c0].bag.begin(), T[c0].bag.end(), T[t].bag.begin(), T[t].bag.end()))
++        continue;
++
++      vertex_t d = boost::add_vertex(T);
++
++      boost::add_edge(d, c0, T);
++      boost::remove_edge(t, c0, T);
++      std::set_intersection(T[t].bag.begin(), T[t].bag.end(), T[c0].bag.begin(), T[c0].bag.end(), std::inserter(T[d].bag, T[d].bag.begin()));
++      boost::add_edge(t, d, T);
++    }
+ }
+ 
+ // Ensure that all nodes' bags' sizes differ by at most one to their successors'.
+ template <class T_t>
+-void nicify_diffs_more(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t)
++void nicify_diffs_more(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    vertex_t c1;
++    int stage;
++  };
+ 
+-  boost::tie(c, c_end) = adjacent_vertices(t, T);
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, root, 0});
+ 
+-  switch (boost::out_degree(t, T))
++  while (!stack.empty())
+     {
+-    case 0:
+-      if (T[t].bag.size() > 1)
++      frame &f = stack.back();
++      const vertex_t t = f.t;
++
++      if (f.stage == 1)
+         {
+-          typename boost::graph_traits<T_t>::vertex_descriptor d = boost::add_vertex(T);
+-          T[d].bag = T[t].bag;
+-          T[d].bag.erase(T[d].bag.begin());
+-          T[d].weight = 0;
+-          boost::add_edge(t, d, T);
+-          nicify_diffs_more(T, t);
++          T[t].weight = T[f.c0].weight;
++          stack.pop_back();
++          continue;
+         }
+-      else
+-        T[t].weight = 0;
+-      return;
+-    case 1:
+-      break;
+-    case 2:
+-      c0 = *c++;
+-      c1 = *c;
+-      nicify_diffs_more(T, c0);
+-      nicify_diffs_more(T, c1);
+-      {
+-        const unsigned l = T[c0].weight;
+-        const unsigned r = T[c1].weight;
+-        T[t].weight = (l == r) ? l + 1 : std::max(l , r);
+-      }
+-      return;
+-    default:
+-      std::cerr << "nicify_diffs_more error.\n";
+-      return;
+-    }
++      if (f.stage == 2)
++        {
++          const vertex_t c1 = f.c1;
++          f.stage = 3;
++          stack.push_back(frame{c1, c1, c1, 0});
++          continue;
++        }
++      if (f.stage == 3)
++        {
++          const unsigned l = T[f.c0].weight;
++          const unsigned r = T[f.c1].weight;
++          T[t].weight = (l == r) ? l + 1 : std::max(l , r);
++          stack.pop_back();
++          continue;
++        }
+ 
+-  c0 = *c;
++      adjacency_iter_t c, c_end;
++      boost::tie(c, c_end) = adjacent_vertices(t, T);
+ 
+-  size_t c0_size, t_size;
+-  t_size = T[t].bag.size();
+-  c0_size = T[c0].bag.size();
++      switch (boost::out_degree(t, T))
++        {
++        case 0:
++          if (T[t].bag.size() > 1)
++            {
++              vertex_t d = boost::add_vertex(T);
++              T[d].bag = T[t].bag;
++              T[d].bag.erase(T[d].bag.begin());
++              T[d].weight = 0;
++              boost::add_edge(t, d, T);
++            }
++          else
++            {
++              T[t].weight = 0;
++              stack.pop_back();
++            }
++          continue;
++        case 1:
++          break;
++        case 2:
++          {
++            const vertex_t c0 = *c++;
++            const vertex_t c1 = *c;
++            f.c0 = c0;
++            f.c1 = c1;
++            f.stage = 2;
++            stack.push_back(frame{c0, c0, c0, 0});
++          }
++          continue;
++        default:
++          std::cerr << "nicify_diffs_more error.\n";
++          stack.pop_back();
++          continue;
++        }
+ 
+-  if (t_size <= c0_size + 1 && t_size + 1 >= c0_size)
+-    {
+-      nicify_diffs_more(T, c0);
+-      T[t].weight = T[c0].weight;
+-      return;
+-    }
++      const vertex_t c0 = *c;
+ 
+-  typename boost::graph_traits<T_t>::vertex_descriptor d = add_vertex(T);
+-  boost::add_edge(d, c0, T);
+-  boost::remove_edge(t, c0, T);
+-  T[d].bag = T[t_size > c0_size ? t : c0].bag;
+-  typename decltype(T[d].bag)::iterator i;
+-  for (i = T[d].bag.begin(); T[t_size < c0_size ? t : c0].bag.find(*i) != T[t_size < c0_size ? t : c0].bag.end(); ++i);
+-  T[d].bag.erase(i);
+-  boost::add_edge(t, d, T);
++      size_t c0_size, t_size;
++      t_size = T[t].bag.size();
++      c0_size = T[c0].bag.size();
+ 
+-  nicify_diffs_more(T, t);
++      if (t_size <= c0_size + 1 && t_size + 1 >= c0_size)
++        {
++          f.c0 = c0;
++          f.stage = 1;
++          stack.push_back(frame{c0, c0, c0, 0});
++          continue;
++        }
++
++      vertex_t d = add_vertex(T);
++      boost::add_edge(d, c0, T);
++      boost::remove_edge(t, c0, T);
++      T[d].bag = T[t_size > c0_size ? t : c0].bag;
++      typename decltype(T[d].bag)::iterator i;
++      for (i = T[d].bag.begin(); T[t_size < c0_size ? t : c0].bag.find(*i) != T[t_size < c0_size ? t : c0].bag.end(); ++i);
++      T[d].bag.erase(i);
++      boost::add_edge(t, d, T);
++    }
+ }
+ 
+ #ifdef HAVE_TREEDEC_COMBINATIONS_HPP
+--- sdcc/src/SDCClospre.hpp
++++ sdcc/src/SDCClospre.hpp
+@@ -315,49 +315,112 @@
+ }
+ 
+ template <class T_t, class G_t>
+-int tree_dec_lospre_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t, const G_t &G)
++int tree_dec_lospre_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root, const G_t &G)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
+-
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  boost::tie(c, c_end) = adjacent_vertices(t, T);
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    vertex_t c1;
++    int stage;
++  };
+ 
+-  switch (out_degree(t, T))
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, root, 0});
++  int result = 0;
++
++  while (!stack.empty())
+     {
+-    case 0:
+-      tree_dec_lospre_leaf(T, t, G);
+-      break;
+-    case 1:
+-      c0 = *c;
+-      if(tree_dec_lospre_nodes(T, c0, G) < 0)
+-        return(-1);
+-      if (T[c0].bag.size() < T[t].bag.size())
++      frame &f = stack.back();
++      const vertex_t t = f.t;
++
++      if (f.stage == 0)
+         {
+-        if (tree_dec_lospre_introduce(T, t, G))
+-          return(-1);
++          adjacency_iter_t c, c_end;
++          boost::tie(c, c_end) = adjacent_vertices(t, T);
++
++          switch (out_degree(t, T))
++            {
++            case 0:
++              tree_dec_lospre_leaf(T, t, G);
++              result = 0;
++              stack.pop_back();
++              break;
++            case 1:
++              {
++                const vertex_t c0 = *c;
++                f.c0 = c0;
++                f.stage = 1;
++                stack.push_back(frame{c0, c0, c0, 0});
++              }
++              break;
++            case 2:
++              {
++                vertex_t c0 = *c++;
++                vertex_t c1 = *c;
++
++                f.c0 = c0;
++                f.c1 = c1;
++                f.stage = 2;
++                stack.push_back(frame{c0, c0, c0, 0});
++              }
++              break;
++            default:
++              std::cerr << "Not nice.\n";
++              result = 0;
++              stack.pop_back();
++              break;
++            }
++          continue;
+         }
+-      else
+-        tree_dec_lospre_forget(T, t, G);
+-      break;
+-    case 2:
+-      c0 = *c++;
+-      c1 = *c;
+-      if(tree_dec_lospre_nodes(T, c0, G) < 0)
+-        return(-1);
+-      if(tree_dec_lospre_nodes(T, c1, G) < 0)
++
++      if (f.stage == 1)
+         {
++          const vertex_t c0 = f.c0;
++          stack.pop_back();
++          if (result < 0)
++            continue;
++          if (T[c0].bag.size() < T[t].bag.size())
++            {
++              if (tree_dec_lospre_introduce(T, t, G))
++                {
++                  result = -1;
++                  continue;
++                }
++            }
++          else
++            tree_dec_lospre_forget(T, t, G);
++          result = 0;
++          continue;
++        }
++
++      if (f.stage == 2)
++        {
++          if (result < 0)
++            {
++              stack.pop_back();
++              continue;
++            }
++          const vertex_t c1 = f.c1;
++          f.stage = 3;
++          stack.push_back(frame{c1, c1, c1, 0});
++          continue;
++        }
++
++      const vertex_t c0 = f.c0;
++      stack.pop_back();
++      if (result < 0)
++        {
+           T[c0].assignments.clear();
+-          return(-1);
++          continue;
+         }
+       tree_dec_lospre_join(T, t, G);
+-      break;
+-    default:
+-      std::cerr << "Not nice.\n";
+-      break;
++      result = 0;
+     }
+-  return(0);
++  return(result);
+ }
+ 
+ template <class T_t, class G_t>
+@@ -462,53 +525,115 @@
+ }
+ 
+ template <class T_t, class G_t>
+-int tree_dec_safety_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t, const G_t &G)
++int tree_dec_safety_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root, const G_t &G)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
+-
+-  boost::tie(c, c_end) = adjacent_vertices(t, T);
+-
+-  switch (out_degree(t, T))
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    vertex_t c1;
++    int stage;
++  };
++
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, root, 0});
++  int result = 0;
++
++  while (!stack.empty())
+     {
+-    case 0:
+-      tree_dec_lospre_leaf(T, t, G);
+-      break;
+-    case 1:
+-      c0 = *c;
+-      if(tree_dec_safety_nodes(T, c0, G) < 0)
+-        return(-1);
+-      if (T[c0].bag.size() < T[t].bag.size())
++      frame &f = stack.back();
++      const vertex_t t = f.t;
++
++      if (f.stage == 0)
+         {
+-        if (tree_dec_lospre_introduce(T, t, G))
+-          return(-1);
+-        }
+-      else
+-        tree_dec_safety_forget(T, t, G);
+-      break;
+-    case 2:
+-      c0 = *c++;
+-      c1 = *c;
++          adjacency_iter_t c, c_end;
++          boost::tie(c, c_end) = adjacent_vertices(t, T);
+ 
+-      if (T[c0].weight < T[c1].weight) // Minimize memory consumption.
+-        std::swap (c0, c1);
++          switch (out_degree(t, T))
++            {
++            case 0:
++              tree_dec_lospre_leaf(T, t, G);
++              result = 0;
++              stack.pop_back();
++              break;
++            case 1:
++              {
++                const vertex_t c0 = *c;
++                f.c0 = c0;
++                f.stage = 1;
++                stack.push_back(frame{c0, c0, c0, 0});
++              }
++              break;
++            case 2:
++              {
++                vertex_t c0 = *c++;
++                vertex_t c1 = *c;
+ 
+-      if(tree_dec_safety_nodes(T, c0, G) < 0)
+-        return(-1);
+-      if(tree_dec_safety_nodes(T, c1, G) < 0)
++              if (T[c0].weight < T[c1].weight) // Minimize memory consumption.
++                std::swap (c0, c1);
++
++                f.c0 = c0;
++                f.c1 = c1;
++                f.stage = 2;
++                stack.push_back(frame{c0, c0, c0, 0});
++              }
++              break;
++            default:
++              std::cerr << "Not nice.\n";
++              result = 0;
++              stack.pop_back();
++              break;
++            }
++          continue;
++        }
++
++      if (f.stage == 1)
++        {
++          const vertex_t c0 = f.c0;
++          stack.pop_back();
++          if (result < 0)
++            continue;
++          if (T[c0].bag.size() < T[t].bag.size())
++            {
++              if (tree_dec_lospre_introduce(T, t, G))
++                {
++                  result = -1;
++                  continue;
++                }
++            }
++          else
++            tree_dec_safety_forget(T, t, G);
++          result = 0;
++          continue;
++        }
++
++      if (f.stage == 2)
++        {
++          if (result < 0)
++            {
++              stack.pop_back();
++              continue;
++            }
++          const vertex_t c1 = f.c1;
++          f.stage = 3;
++          stack.push_back(frame{c1, c1, c1, 0});
++          continue;
++        }
++
++      const vertex_t c0 = f.c0;
++      stack.pop_back();
++      if (result < 0)
+         {
+           T[c0].assignments.clear();
+-          return(-1);
++          continue;
+         }
+       tree_dec_lospre_join(T, t, G);
+-      break;
+-    default:
+-      std::cerr << "Not nice.\n";
+-      break;
++      result = 0;
+     }
+-  return(0);
++  return(result);
+ }
+ 
+ template <class T_t, class G_t>
+--- sdcc/src/SDCCnaddr.hpp
++++ sdcc/src/SDCCnaddr.hpp
+@@ -366,47 +366,91 @@
+ }
+ 
+ template <class T_t, class G_t>
+-int tree_dec_naddrswitch_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor t, const G_t &G)
++int tree_dec_naddrswitch_nodes(T_t &T, typename boost::graph_traits<T_t>::vertex_descriptor root, const G_t &G)
+ {
+   typedef typename boost::graph_traits<T_t>::adjacency_iterator adjacency_iter_t;
+-
+-  adjacency_iter_t c, c_end;
+-  typename boost::graph_traits<T_t>::vertex_descriptor c0, c1;
++  typedef typename boost::graph_traits<T_t>::vertex_descriptor vertex_t;
+ 
+-  boost::tie(c, c_end) = adjacent_vertices(t, T);
++  struct frame
++  {
++    vertex_t t;
++    vertex_t c0;
++    vertex_t c1;
++    int stage;
++  };
+ 
+-  switch (out_degree(t, T))
++  std::vector<frame> stack;
++  stack.push_back(frame{root, root, root, 0});
++  int result = 0;
++
++  while (!stack.empty())
+     {
+-    case 0:
+-      tree_dec_naddrswitch_leaf(T, t, G);
+-      break;
+-    case 1:
+-      c0 = *c;
+-      tree_dec_naddrswitch_nodes(T, c0, G);
+-      if (T[c0].bag.size() < T[t].bag.size())
++      frame &f = stack.back();
++      const vertex_t t = f.t;
++      int r = 0;
++
++      if (f.stage == 0)
+         {
+-        if (tree_dec_naddrswitch_introduce(T, t, G))
+-          return(-1);
+-        }
+-      else
+-        tree_dec_naddrswitch_forget(T, t, G);
+-      break;
+-    case 2:
+-      c0 = *c++;
+-      c1 = *c;
++          adjacency_iter_t c, c_end;
++          boost::tie(c, c_end) = adjacent_vertices(t, T);
+ 
+-      if (T[c0].weight < T[c1].weight) // Minimize memory consumption.
+-        std::swap (c0, c1);
+-
+-      tree_dec_naddrswitch_nodes(T, c0, G);
+-      tree_dec_naddrswitch_nodes(T, c1, G);
+-      tree_dec_naddrswitch_join(T, t, G);
+-      break;
+-    default:
+-      std::cerr << "Not nice.\n";
+-      break;
++          switch (out_degree(t, T))
++            {
++            case 0:
++              tree_dec_naddrswitch_leaf(T, t, G);
++              break;
++            case 1:
++              {
++                const vertex_t c0 = *c;
++                f.c0 = c0;
++                f.stage = 1;
++                stack.push_back(frame{c0, c0, c0, 0});
++              }
++              continue;
++            case 2:
++              {
++                vertex_t c0 = *c++;
++                vertex_t c1 = *c;
++
++                if (T[c0].weight < T[c1].weight) // Minimize memory consumption.
++                  std::swap (c0, c1);
++
++                f.c0 = c0;
++                f.c1 = c1;
++                f.stage = 2;
++                stack.push_back(frame{c0, c0, c0, 0});
++              }
++              continue;
++            default:
++              std::cerr << "Not nice.\n";
++              break;
++            }
++        }
++      else if (f.stage == 1)
++        {
++          if (T[f.c0].bag.size() < T[t].bag.size())
++            {
++              if (tree_dec_naddrswitch_introduce(T, t, G))
++                r = -1;
++            }
++          else
++            tree_dec_naddrswitch_forget(T, t, G);
++        }
++      else if (f.stage == 2)
++        {
++          const vertex_t c1 = f.c1;
++          f.stage = 3;
++          stack.push_back(frame{c1, c1, c1, 0});
++          continue;
++        }
++      else
++        tree_dec_naddrswitch_join(T, t, G);
++
++      stack.pop_back();
++      if (stack.empty())
++        result = r;
+     }
+-  return(0);
++  return(result);
+ }
+ 
+ template <class G_t>
